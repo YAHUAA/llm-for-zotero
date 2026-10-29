@@ -398,6 +398,8 @@ const zhCN: Record<string, string> = {
   "File unpinned": "文件已取消固定",
   "Selected text removed": "已移除选中文本",
   Cancelled: "已取消",
+  "Connection interrupted. Retrying": "连接中断，等待重试",
+  "Recovering response": "正在恢复回复",
   "Select a region...": "选择一个区域...",
   "Selection cancelled": "选择已取消",
   "Screenshot failed": "截图失败",

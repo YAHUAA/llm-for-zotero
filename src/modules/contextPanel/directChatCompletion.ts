@@ -7,6 +7,21 @@ import {
   type UsageStats,
 } from "../../utils/llmClient";
 import { sanitizeText } from "../../utils/textSanitization";
+import {
+  createContinuationDeltas,
+  DIRECT_CHAT_RETRY_DELAYS,
+  directChatRetryDelay,
+  throwIfChatAborted,
+  waitForChatRetry,
+} from "./directChatRecovery";
+
+export type DirectChatRecoveryEvent = {
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  hasPartialText: boolean;
+  phase: "waiting" | "retrying";
+};
 
 export const EMPTY_OUTPUT_LIMIT_MESSAGE =
   "The model used its available output on reasoning before producing an answer. Try Continue, lower reasoning effort, or choose another model.";
@@ -61,51 +76,106 @@ export async function callDirectChatTurnWithRecovery(params: {
   onDelta: (delta: string) => void;
   onReasoning?: (event: ReasoningEvent) => void;
   onUsage?: (usage: UsageStats) => void;
+  onRecovery?: (event: DirectChatRecoveryEvent) => void;
   call?: typeof callLLMStream;
+  wait?: typeof waitForChatRetry;
 }): Promise<ModelTurnOutcome> {
   const call = params.call ?? callLLMStream;
-  const first = await call(
-    params.request,
-    params.onDelta,
-    params.onReasoning,
-    params.onUsage,
-  );
-  if (
-    first.completion.status !== "incomplete" ||
-    first.completion.reason !== "output_limit" ||
-    first.text.trim()
-  ) {
-    return first;
-  }
+  const wait = params.wait ?? waitForChatRetry;
+  const originalRequest = { ...params.request, requireStreamCompletion: true };
+  let request = originalRequest;
+  let text = "";
+  let retries = 0;
+  let recoveredEmptyOutput = false;
 
-  (
-    globalThis as typeof globalThis & {
-      ztoolkit?: { log?: (...args: unknown[]) => void };
+  while (true) {
+    throwIfChatAborted(params.request.signal);
+    let receivedDelta = false;
+    const deltas = createContinuationDeltas(text, (delta) => {
+      text += delta;
+      params.onDelta(delta);
+    });
+    let outcome: ModelTurnOutcome;
+    try {
+      outcome = await call(
+        request,
+        (delta) => {
+          if (delta) receivedDelta = true;
+          deltas.push(delta);
+        },
+        params.onReasoning,
+        params.onUsage,
+      );
+    } catch (error) {
+      // Flush even on failure so the existing interrupted-turn UI retains text.
+      deltas.flush();
+      throwIfChatAborted(params.request.signal);
+      const delay = directChatRetryDelay(error, retries);
+      if (
+        delay === undefined ||
+        (params.request.authMode && params.request.authMode !== "api_key")
+      ) {
+        throw error;
+      }
+      const recovery: DirectChatRecoveryEvent = {
+        attempt: ++retries,
+        maxAttempts: DIRECT_CHAT_RETRY_DELAYS.length,
+        delayMs: delay,
+        hasPartialText: !!text,
+        phase: "waiting",
+      };
+      params.onRecovery?.(recovery);
+      await wait(delay, params.request.signal);
+      throwIfChatAborted(params.request.signal);
+      params.onRecovery?.({ ...recovery, phase: "retrying" });
+      if (text) {
+        // A failed POST stream has no portable replay cursor. Start a new
+        // generation with the original context and the visible partial answer.
+        request = {
+          ...originalRequest,
+          continuationState: undefined,
+          history: [
+            ...(params.request.history || []),
+            { role: "user", content: params.request.prompt },
+            { role: "assistant", content: text },
+          ],
+          prompt:
+            "The connection was interrupted during your previous answer. Continue exactly where that answer stopped, including any unfinished sentence or code block. Do not repeat any text already shown, restart the answer, or add a preamble. Preserve the original language and formatting.",
+        };
+      }
+      continue;
     }
-  ).ztoolkit?.log?.("LLM: Recovering empty output-limited direct-chat turn", {
-    settingMode: params.request.outputTokenLimit?.mode || "auto",
-    providerStopReason: first.completion.providerReason,
-    recoveryCount: 1,
-  });
-  const responseId =
-    first.continuationState &&
-    typeof first.continuationState === "object" &&
-    typeof (first.continuationState as { responseId?: unknown }).responseId ===
-      "string"
-      ? (first.continuationState as { responseId: string }).responseId
-      : undefined;
-  const continuationHistory = responseId
-    ? undefined
-    : [
-        ...(params.request.history || []),
-        { role: "user" as const, content: params.request.prompt },
-      ];
-  return call(
-    {
-      ...params.request,
+    // Some non-streaming providers return their text without invoking onDelta.
+    if (!receivedDelta && outcome.text) deltas.push(outcome.text);
+    deltas.flush();
+    throwIfChatAborted(params.request.signal);
+    if (
+      recoveredEmptyOutput ||
+      outcome.completion.status !== "incomplete" ||
+      outcome.completion.reason !== "output_limit" ||
+      text.trim()
+    ) {
+      return { ...outcome, text };
+    }
+
+    recoveredEmptyOutput = true;
+    const responseId =
+      outcome.continuationState &&
+      typeof outcome.continuationState === "object" &&
+      typeof (outcome.continuationState as { responseId?: unknown })
+        .responseId === "string"
+        ? (outcome.continuationState as { responseId: string }).responseId
+        : undefined;
+    request = {
+      ...originalRequest,
       prompt:
         "Continue from the prior response. Produce the answer now without repeating prior text.",
-      history: continuationHistory,
+      history: responseId
+        ? undefined
+        : [
+            ...(params.request.history || []),
+            { role: "user", content: params.request.prompt },
+          ],
       ...(responseId
         ? {
             context: undefined,
@@ -113,9 +183,6 @@ export async function callDirectChatTurnWithRecovery(params: {
             continuationState: { responseId },
           }
         : {}),
-    },
-    params.onDelta,
-    params.onReasoning,
-    params.onUsage,
-  );
+    };
+  }
 }

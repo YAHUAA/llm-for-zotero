@@ -168,6 +168,8 @@ export type ChatParams = {
   context?: string;
   history?: ChatMessage[];
   signal?: AbortSignal;
+  /** Direct-chat recovery must distinguish a truncated SSE stream from completion. */
+  requireStreamCompletion?: boolean;
   /** Base64 data URL of an image to include with the prompt (legacy single-image field) */
   image?: string;
   /** Base64 data URLs to include with the prompt */
@@ -4650,9 +4652,22 @@ export async function callLLMStream(
     return callLLM(params);
   }
 
+  const streamOptions = { requireCompletion: params.requireStreamCompletion };
   return useResponses
-    ? parseResponsesStream(res.body, onDelta, onReasoning, onUsage)
-    : parseStreamResponse(res.body, onDelta, onReasoning, onUsage);
+    ? parseResponsesStream(
+        res.body,
+        onDelta,
+        onReasoning,
+        onUsage,
+        streamOptions,
+      )
+    : parseStreamResponse(
+        res.body,
+        onDelta,
+        onReasoning,
+        onUsage,
+        streamOptions,
+      );
 }
 
 /**
@@ -4837,11 +4852,13 @@ export async function parseStreamResponse(
   onDelta: (delta: string) => void,
   onReasoning?: (event: ReasoningEvent) => void,
   onUsage?: (usage: UsageStats) => void,
+  options: { requireCompletion?: boolean } = {},
 ): Promise<ModelTurnOutcome> {
   const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
+  let sawCompletion = false;
   let completion: ModelTurnCompletion = COMPLETE_MODEL_TURN;
   const thoughtState: ThoughtTagState = {
     inThought: false,
@@ -4850,11 +4867,12 @@ export async function parseStreamResponse(
   };
 
   try {
-    while (true) {
+    readStream: while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+      // Process a final SSE line even when the peer omits its trailing newline.
+      buffer += done
+        ? decoder.decode() + "\n"
+        : decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -4863,7 +4881,11 @@ export async function parseStreamResponse(
         if (!trimmed.startsWith("data:")) continue;
 
         const data = trimmed.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
+        if (!data) continue;
+        if (data === "[DONE]") {
+          sawCompletion = true;
+          break readStream;
+        }
 
         try {
           const parsed = JSON.parse(data) as {
@@ -4899,6 +4921,7 @@ export async function parseStreamResponse(
           const choice = parsed?.choices?.[0];
           if (typeof choice?.finish_reason === "string") {
             completion = normalizeProviderCompletion(choice.finish_reason);
+            sawCompletion = true;
           }
           const reasoningDelta = normalizeStreamText(
             choice?.delta?.reasoning_content ??
@@ -4934,8 +4957,20 @@ export async function parseStreamResponse(
           appLogger.warn("LLM stream parse error:", err);
         }
       }
+      if (done) break;
     }
+    if (options.requireCompletion && !sawCompletion) {
+      const error = new Error(
+        "NetworkError: response stream ended before completion",
+      );
+      error.name = "NetworkError";
+      throw error;
+    }
+  } catch (error) {
+    // A transport error after a provider's terminal event cannot truncate text.
+    if (!sawCompletion) throw error;
   } finally {
+    if (sawCompletion) void reader.cancel().catch(() => undefined);
     const tail = resolveUnterminatedThought(thoughtState);
     if (tail.text) {
       if (tail.asAnswer) {
@@ -4956,11 +4991,13 @@ export async function parseResponsesStream(
   onDelta: (delta: string) => void,
   onReasoning?: (event: ReasoningEvent) => void,
   onUsage?: (usage: UsageStats) => void,
+  options: { requireCompletion?: boolean } = {},
 ): Promise<ModelTurnOutcome> {
   const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
+  let sawCompletion = false;
   let completion: ModelTurnCompletion = COMPLETE_MODEL_TURN;
   const thoughtState: ThoughtTagState = {
     inThought: false,
@@ -5152,11 +5189,12 @@ export async function parseResponsesStream(
   };
 
   try {
-    while (true) {
+    readStream: while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+      // Process a final SSE line even when the peer omits its trailing newline.
+      buffer += done
+        ? decoder.decode() + "\n"
+        : decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -5165,7 +5203,11 @@ export async function parseResponsesStream(
         if (!trimmed.startsWith("data:")) continue;
 
         const data = trimmed.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
+        if (!data) continue;
+        if (data === "[DONE]") {
+          sawCompletion = true;
+          break readStream;
+        }
 
         try {
           const parsed = JSON.parse(data) as {
@@ -5207,6 +5249,12 @@ export async function parseResponsesStream(
             typeof parsed.type === "string" ? parsed.type.toLowerCase() : "";
           if (typeof parsed.response?.id === "string") {
             responseId = parsed.response.id;
+          }
+
+          if (eventType === "response.failed") {
+            completion = normalizeProviderCompletion(undefined, {
+              responseStatus: "failed",
+            });
           }
 
           if (eventType === "response.incomplete") {
@@ -5438,12 +5486,32 @@ export async function parseResponsesStream(
               emitReasoningFromOutputItem(out);
             }
           }
+          if (
+            eventType === "response.completed" ||
+            eventType === "response.incomplete" ||
+            eventType === "response.failed"
+          ) {
+            sawCompletion = true;
+            break readStream;
+          }
         } catch (err) {
           appLogger.warn("LLM responses stream parse error:", err);
         }
       }
+      if (done) break;
     }
+    if (options.requireCompletion && !sawCompletion) {
+      const error = new Error(
+        "NetworkError: response stream ended before completion",
+      );
+      error.name = "NetworkError";
+      throw error;
+    }
+  } catch (error) {
+    // A transport error after a provider's terminal event cannot truncate text.
+    if (!sawCompletion) throw error;
   } finally {
+    if (sawCompletion) void reader.cancel().catch(() => undefined);
     const tail = resolveUnterminatedThought(thoughtState);
     if (tail.text) {
       if (tail.asAnswer) {

@@ -7212,6 +7212,13 @@ export async function retryLatestAssistantResponse(
           onDelta: assistantTurn.push,
           onReasoning: handleReasoning,
           onUsage: handleUsage,
+          onRecovery: ({ phase, attempt, maxAttempts, delayMs }) =>
+            setStatusSafely(
+              phase === "waiting"
+                ? `${t("Connection interrupted. Retrying")} (${attempt}/${maxAttempts}, ${Math.ceil(delayMs / 1000)}s)`
+                : `${t("Recovering response")} (${attempt}/${maxAttempts})`,
+              "sending",
+            ),
         });
 
     if (assistantTurn.wasCancelled()) {
@@ -10113,6 +10120,13 @@ export async function sendQuestion(
           onDelta: assistantTurn.push,
           onReasoning: handleReasoning,
           onUsage: handleUsage,
+          onRecovery: ({ phase, attempt, maxAttempts, delayMs }) =>
+            setStatusSafely(
+              phase === "waiting"
+                ? `${t("Connection interrupted. Retrying")} (${attempt}/${maxAttempts}, ${Math.ceil(delayMs / 1000)}s)`
+                : `${t("Recovering response")} (${attempt}/${maxAttempts})`,
+              "sending",
+            ),
         });
     if (assistantTurn.wasCancelled()) {
       assistantTurn.noteUsageOutcome("abort");

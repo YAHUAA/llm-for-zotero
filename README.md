@@ -4,6 +4,8 @@
 
 # LLM-for-Zotero: A Research Agent System for your Zotero Library
 
+> **Stream recovery fork (3.9.15-stream-recovery.1).** Based on upstream 3.9.15. Ordinary API-key chat automatically retries transient stream failures, keeps partial answers, and supports cancellation during backoff. See [recovery behavior, testing, and installation](STREAM_RECOVERY.md). The upstream documentation below remains applicable.
+
 [![Zotero support](https://img.shields.io/badge/Zotero-supported-green?style=flat-square&logo=zotero&logoColor=CC2936)](https://www.zotero.org)
 [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg?style=flat-square)](https://www.gnu.org/licenses/agpl-3.0)

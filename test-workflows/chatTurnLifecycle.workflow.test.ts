@@ -1,4 +1,5 @@
 import { assert } from "chai";
+import { t } from "../src/utils/i18n";
 import { saveAgentRunTraceSnapshot } from "../src/agent/store/traceStore";
 import type { AgentRunEventRecord } from "../src/agent/types";
 import {
@@ -296,8 +297,9 @@ describe("workflow: plain-chat turn lifecycle (send and retry)", function () {
     );
   /** Sends one question that completes, as the start of each retry case. */
   const completedSend = async (question: string, answer: string) => {
+    const streamsBefore = streams.length;
     const started = await startSend(question);
-    const stream = await nextStream(streams.length);
+    const stream = await nextStream(streamsBefore);
     stream.push(answer);
     stream.usage(11, 7);
     stream.finish();
@@ -552,6 +554,65 @@ describe("workflow: plain-chat turn lifecycle (send and retry)", function () {
         tokenSource: "provider",
       });
       assert.equal(await statusText(), "Ready");
+    });
+  });
+
+  it("send recovers a disconnected stream in one stored assistant message", async function () {
+    await surfacing(async () => {
+      const started = await startSend("Continue after a temporary disconnect.");
+      const first = await nextStream(0);
+      first.push("The first finding is ");
+      await waitForPartial(started.conversationKey, "first finding");
+      first.fail("Error in input stream");
+      await waitFor(
+        statusText,
+        (text) => text.includes(t("Connection interrupted. Retrying")),
+        "retry status",
+      );
+      assert.isTrue((await read(started.conversationKey)).requestPending);
+      const second = await nextStream(1);
+      assert.include(second.requestBody, "The first finding is ");
+      second.push("a reproducible improvement.");
+      second.finish();
+      const state = await waitForSendSettled(started);
+      assert.lengthOf(state.memory, 2);
+      assert.lengthOf(state.storedRows, 2);
+      assert.equal(
+        lastAssistant(state).text,
+        "The first finding is a reproducible improvement.",
+      );
+      assert.equal(
+        storedOf(state, "assistant").text,
+        lastAssistant(state).text,
+      );
+      assert.notProperty(lastAssistant(state), "interrupted");
+      assert.equal(lastAssistant(state).completionStatus, "complete");
+      assert.equal(await statusText(), "Ready");
+    });
+  });
+
+  it("Stop during retry backoff keeps partial text and dispatches no continuation", async function () {
+    await surfacing(async () => {
+      const started = await startSend("Stop while waiting to reconnect.");
+      const first = await nextStream(0);
+      first.push("Keep this partial answer.");
+      await waitForPartial(started.conversationKey, "partial answer");
+      first.fail("Error in input stream");
+      await waitFor(
+        statusText,
+        (text) => text.includes(t("Connection interrupted. Retrying")),
+        "retry status",
+      );
+      panelElement("#llm-cancel").click();
+      const state = await waitForSendSettled(started);
+      assert.lengthOf(streams, 1);
+      assert.equal(lastAssistant(state).text, "Keep this partial answer.");
+      assert.equal(
+        storedOf(state, "assistant").text,
+        lastAssistant(state).text,
+      );
+      assert.notProperty(lastAssistant(state), "interrupted");
+      assert.equal(await statusText(), "Cancelled");
     });
   });
 
@@ -1088,7 +1149,7 @@ describe("workflow: plain-chat turn lifecycle (send and retry)", function () {
         before.storedRows,
         "stored rows are restored exactly",
       );
-      assert.equal(await statusText(), "Cancelled");
+      assert.equal(await statusText(), t("Cancelled"));
     });
   });
 
